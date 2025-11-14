@@ -178,6 +178,10 @@ class DataArguments:
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
     )
+    n_dims: int = field(
+        default=20,
+        metadata={"help": "Number of dimensions for the data."},
+    )
 
     def __post_init__(self):
         if self.text_keys is None:
@@ -421,6 +425,14 @@ class TrainingArguments:
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
+    )
+    task_name: str = field(
+        default=None,
+        metadata={"help": "Name of the task."},
+    )
+    curriculum: Dict[str, Any] = field(
+        default=None,
+        metadata={"help": "Curriculum for the task."},
     )
 
 

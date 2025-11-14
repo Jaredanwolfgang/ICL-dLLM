@@ -86,7 +86,8 @@ class HuggingfaceLoader(BaseModelLoader):
         if isinstance(model, PreTrainedModel) and getattr(model.config, "tie_word_embeddings", True):
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+            if input_embeddings is not None and output_embeddings is not None:
+                output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
 
         return model
 
@@ -132,7 +133,8 @@ class CustomizedModelingLoader(BaseModelLoader):
         if isinstance(model, PreTrainedModel) and getattr(model.config, "tie_word_embeddings", True):
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+            if input_embeddings is not None and output_embeddings is not None:
+                output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
 
         return model
 

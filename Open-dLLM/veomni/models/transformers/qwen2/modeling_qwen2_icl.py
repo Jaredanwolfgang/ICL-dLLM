@@ -800,37 +800,33 @@ class KwargsForCausalLM(FlashAttentionKwargs, ): ...
 
 
 class Qwen2ForCausalLM(Qwen2PreTrainedModel,  MDMGenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen2Model(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if not hasattr(config, "n_dims"):
+            raise ValueError("`config.n_dims` must be provided for in-context regression tasks.")
+        configuration = Qwen2Config(
+            vocab_size=1,  # using embeddings directly, not tokens
+            hidden_size=config.n_embd,
+            intermediate_size=config.n_embd * 4,  # Standard ratio for transformers(?)
+            num_hidden_layers=config.n_layer,
+            num_attention_heads=config.n_head,
+            num_key_value_heads=config.n_head,  
+            max_position_embeddings=2 * config.n_positions,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            use_cache=False,
+        )
+        self.name = f"gpt2_embd={config.n_embd}_layer={config.n_layer}_head={config.n_head}"
+        self.n_positions = config.n_positions
+        self.n_dims = config.n_dims
+        self.n_embd = config.n_embd
+        self._read_in = nn.Linear(self.n_dims, self.n_embd)
+        self.model = Qwen2Model(configuration)
+        self.lm_head = nn.Linear(self.n_embd, 1)
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def set_decoder(self, decoder):
-        self.model = decoder
-
-    def get_decoder(self):
-        return self.model
-
+    
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -849,142 +845,130 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel,  MDMGenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         is_causal: bool = True,
+        inds: Optional[Union[torch.Tensor, List[int]]] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        r"""
+        """
         Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
-
+            input_ids: Tensor of shape (batch, 2 * n_points, n_dims) - combined xs and ys sequence.
+            attention_mask: Tensor of shape (batch, 2 * n_points) or (batch, 2 * n_points, 1).
+            labels: Tensor of shape (batch, n_points) - original ys values.
+            inds: Optional indices specifying which points to predict. Defaults to all points.
+            mask_ratio: Optional mask ratio for diffusion training.
         Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, Qwen2ForCausalLM
-
-        >>> model = Qwen2ForCausalLM.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+            predictions shaped (batch, len(inds)) matching the TransformerModel baseline.
+        """
+        # Set default values from config if not provided
+        output_attentions = output_attentions if output_attentions is not None else getattr(self.config, "output_attentions", False)
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else getattr(self.config, "output_hidden_states", False)
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else getattr(self.config, "use_return_dict", True)
+        
+        if labels is not None:
+            if inds is None:
+                inds_tensor = torch.arange(labels.shape[1], device=labels.device)
+            else:
+                inds_tensor = torch.as_tensor(inds, device=labels.device, dtype=torch.long)
+                if inds_tensor.min().item() < 0 or inds_tensor.max().item() >= labels.shape[1]:
+                    raise ValueError("`inds` contains indices outside the valid range.")
+        else:
+            # If no labels, assume we want to predict all y positions
+            n_points = input_ids.shape[1] // 2
+            inds_tensor = torch.arange(n_points, device=input_ids.device)
 
-        if not get_parallel_state().sp_enabled and labels is not None:
-            # Shift so that tokens < n predict n
-            labels = labels[..., 1:].contiguous()
-            labels = labels.view(-1)
-            if (
-                position_ids is not None
-                and position_ids.size(0) == 1
-                and not (torch.diff(position_ids, dim=-1) >= 0).all()
-            ):
-                position_ids_ = position_ids.flatten()
-                indices_q = torch.arange(position_ids_.size(0), device=position_ids_.device, dtype=torch.int32)
-                cu_seq_lens = torch.cat(
-                    (
-                        indices_q[position_ids_ == 0],
-                        torch.tensor(position_ids_.size(), device=position_ids_.device, dtype=torch.int32),
-                    )
-                )
-                labels[cu_seq_lens[1:-1] - 1] = IGNORE_INDEX
-        if mask_ratio is not None:
-            is_causal = False
-            mask_ratio = mask_ratio[..., 1:].contiguous()
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            is_causal=is_causal,
-            **kwargs,
-        )
-
-        hidden_states = outputs[0]
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        hidden_states = hidden_states[:, slice_indices, :]
+        input_ids = input_ids.to(dtype=self._read_in.weight.dtype)
+        
+        # Handle 4D input_ids if needed
+        if input_ids.dim() == 4:
+            batch_size, seq_len, seq_length, n_dims = input_ids.shape
+            input_ids = input_ids.view(batch_size * seq_len, seq_length, n_dims)
+            if labels is not None:
+                labels = labels.view(batch_size * seq_len, -1)
+        
+        # Process through model
+        input_emb = self._read_in(input_ids)
+        outputs = self.model(inputs_embeds=input_emb)
+        hidden_states = outputs.last_hidden_state
+        
+        # Extract hidden states at y positions (odd indices: 1, 3, 5, ...)
+        # hidden_states shape: (batch, 2 * n_points, n_embd)
+        # Extract y positions: [1, 3, 5, ..., 2*n_points-1]
+        y_hidden_states = hidden_states[:, 1::2, :]  # (batch, n_points, n_embd)
+        
+        # Select indices if specified
+        if inds_tensor is not None:
+            y_hidden_states = y_hidden_states[:, inds_tensor, :]
+            if labels is not None:
+                labels = labels[:, inds_tensor]
 
         loss = None
         logits = None
         if labels is not None:
             labels = labels.view(-1)  # flatten label
-            if is_liger_kernel_available():
-                if mask_ratio is not None:
-                    loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="none",ignore_index=IGNORE_INDEX)
-                    if not get_parallel_state().sp_enabled:
-                        # Shift so that tokens < n predict n
-                        hidden_states = hidden_states[..., :-1, :].contiguous()
-                    loss = loss_fct(
-                        self.lm_head.weight, 
-                        hidden_states.view(-1, self.config.hidden_size),
-                        labels
-                    )
-                    path_loss = (-loss).exp().detach() * loss
+            if mask_ratio is not None:
+                # Use MSE loss for regression tasks with path loss weighting
+                logits = self.lm_head(y_hidden_states)  # (batch, n_points, 1)
+                logits = logits.view(-1, 1)  # (batch * n_points, 1)
+                labels_float = labels.float().view(-1, 1)  # (batch * n_points, 1)
+                
+                # Compute loss only for non-ignored positions
+                loss_mask = labels != IGNORE_INDEX
+                if loss_mask.any():
+                    mse_loss = (logits - labels_float).square()
+                    loss = mse_loss.view(-1)
+                    
+                    # Path loss: exp(-loss) * loss for better gradient flow
+                    # Clamp loss to avoid numerical instability
+                    loss_clamped = torch.clamp(loss, max=10.0)
+                    path_loss = (-loss_clamped).exp().detach() * loss
                     loss = loss + path_loss
-                    loss_mask = labels != IGNORE_INDEX
-                    loss = (loss * loss_mask * (1/mask_ratio)).sum() / (loss_mask.sum() + 1e-8)
+                    
+                    # mask_ratio shape: (batch_size, 1) or (batch_size,) -> expand to match loss shape
+                    mask_ratio_flat = mask_ratio.view(-1)  # (batch_size,)
+                    
+                    # Calculate how many points per sample
+                    n_points_per_sample = loss.shape[0] // mask_ratio_flat.shape[0] if mask_ratio_flat.shape[0] > 0 else 1
+                    
+                    # Repeat mask_ratio for each point in each sample
+                    if n_points_per_sample > 1:
+                        mask_ratio_flat = mask_ratio_flat.repeat_interleave(n_points_per_sample)
+                    # Ensure same length
+                    if mask_ratio_flat.shape[0] < loss.shape[0]:
+                        # Pad with last value if needed
+                        last_val = mask_ratio_flat[-1] if mask_ratio_flat.shape[0] > 0 else torch.tensor(0.5, device=mask_ratio.device)
+                        mask_ratio_flat = torch.cat([mask_ratio_flat, last_val.repeat(loss.shape[0] - mask_ratio_flat.shape[0])])
+                    mask_ratio_flat = mask_ratio_flat[:loss.shape[0]]
+                    
+                    # Use mask_ratio for weighting, but clamp to avoid extreme values
+                    # Clamp mask_ratio to reasonable range
+                    mask_ratio_weight = torch.clamp(mask_ratio_flat, min=0.1, max=0.9)
+                    # Weight by inverse mask ratio (higher mask ratio = lower weight, as we have more masked tokens)
+                    # But we want to normalize to avoid extreme scales
+                    weight = 1.0 / (mask_ratio_weight + 1e-8)
+                    # Normalize weights to have mean 1.0 to stabilize loss scale across different mask ratios
+                    weight_mean = weight[loss_mask].mean() if loss_mask.any() else torch.tensor(1.0, device=weight.device)
+                    if weight_mean > 1e-8:
+                        weight = weight / weight_mean
+                    
+                    loss = (loss * loss_mask * weight).sum() / (loss_mask.sum() + 1e-8)
                 else:
-                    loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="mean")
-                    if not get_parallel_state().sp_enabled:
-                        # Shift so that tokens < n predict n
-                        hidden_states = hidden_states[..., :-1, :].contiguous()
-                    hidden_states = hidden_states.view(-1, self.config.hidden_size)
-                    loss = loss_fct(self.lm_head.weight, hidden_states, labels)
+                    loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
             else:
-                if mask_ratio is not None:
-                    loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-                    logits = self.lm_head(hidden_states)
-                    logits = logits.view(-1, self.vocab_size)
-                    loss = loss_fct(logits, labels.view(-1))
-                    path_loss = (-loss).exp().detach() * loss
-                    loss = loss + path_loss
-                    loss_mask = labels != IGNORE_INDEX
-                    loss = (loss * loss_mask * (1/mask_ratio)).sum() / (loss_mask.sum() + 1e-8)
+                # Standard MSE loss for regression
+                logits = self.lm_head(y_hidden_states)  # (batch, n_points, 1)
+                logits = logits.view(-1, 1)  # (batch * n_points, 1)
+                labels_float = labels.float().view(-1, 1)  # (batch * n_points, 1)
+                
+                # Compute loss only for non-ignored positions
+                loss_mask = labels != IGNORE_INDEX
+                if loss_mask.any():
+                    mse_loss = (logits - labels_float).square()
+                    loss = (mse_loss.view(-1) * loss_mask).sum() / (loss_mask.sum() + 1e-8)
                 else:
-                    loss_fct = torch.nn.CrossEntropyLoss(reduction="mean")
-                    logits = self.lm_head(hidden_states)
-                    # Upcast to float if we need to compute the loss to avoid potential precision issues
-                    logits = logits.float()
-                    if not get_parallel_state().sp_enabled:
-                        # Shift so that tokens < n predict n
-                        logits = logits[..., :-1, :].contiguous()
-
-                    # Flatten the tokens
-                    logits = logits.view(-1, self.vocab_size)
-                    loss = loss_fct(logits, labels)
-
-            if get_parallel_state().sp_enabled:
-                num_valid_tokens = (labels != IGNORE_INDEX).sum()
-                loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
+                    loss = torch.tensor(0.0, device=logits.device, requires_grad=True) 
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.lm_head(y_hidden_states)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1076,6 +1060,6 @@ if is_liger_kernel_available():
     logger.info_rank0("Apply liger kernel to Qwen2.")
 
 
-# ModelClass = Qwen2ForCausalLM
+ModelClass = Qwen2ForCausalLM
 
 __all__ = ["Qwen2ForCausalLM", "Qwen2Model", "Qwen2PreTrainedModel"]
