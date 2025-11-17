@@ -1,7 +1,5 @@
 import math
-
 import torch
-
 
 def squared_error(ys_pred, ys):
     return (ys - ys_pred).square()

@@ -1,20 +1,21 @@
+import argparse
 import os
-from random import randint
 import uuid
+from random import randint
+from typing import Sequence
 
-from quinine import QuinineArgumentParser
-from tqdm import tqdm
 import torch
 import yaml
-
-from eval import get_run_metrics
-from tasks import get_task_sampler
-from samplers import get_data_sampler
-from curriculum import Curriculum
-from schema import schema
-from models import build_model
+from tqdm import tqdm
 
 import wandb
+
+from curriculum import Curriculum
+from eval import get_run_metrics
+from models import build_model
+from samplers import get_data_sampler
+from schema import Config, load_config
+from tasks import get_task_sampler
 
 torch.backends.cudnn.benchmark = True
 
@@ -27,6 +28,13 @@ def train_step(model, xs, ys, optimizer, loss_func):
     optimizer.step()
     return loss.detach().item(), output.detach()
 
+def diffusion_train_step(model, xs, ys, optimizer):
+    optimizer.zero_grad()
+    loss, output, masked_indices = model.compute_loss(xs, ys)
+    masked_ratio = masked_indices.sum().item() / masked_indices.numel()
+    loss.backward()
+    optimizer.step()
+    return loss.detach().item(), output.detach(), masked_ratio
 
 def sample_seeds(total_seeds, count):
     seeds = set()
@@ -85,8 +93,11 @@ def train(model, args):
         ys = task.evaluate(xs)
 
         loss_func = task.get_training_metric()
-
-        loss, output = train_step(model, xs.cuda(), ys.cuda(), optimizer, loss_func)
+        
+        if args.model.family == "diffusion_gpt2":
+            loss, output, masked_ratio = diffusion_train_step(model, xs.cuda(), ys.cuda(), optimizer)
+        else:
+            loss, output = train_step(model, xs.cuda(), ys.cuda(), optimizer, loss_func)
 
         point_wise_tags = list(range(curriculum.n_points))
         point_wise_loss_func = task.get_metric()
@@ -100,19 +111,38 @@ def train(model, args):
             / curriculum.n_points
         )
 
-        if i % args.wandb.log_every_steps == 0 and not args.test_run:
-            wandb.log(
-                {
-                    "overall_loss": loss,
-                    "excess_loss": loss / baseline_loss,
-                    "pointwise/loss": dict(
-                        zip(point_wise_tags, point_wise_loss.cpu().numpy())
-                    ),
-                    "n_points": curriculum.n_points,
-                    "n_dims": curriculum.n_dims_truncated,
-                },
-                step=i,
-            )
+        if (
+            args.wandb.enabled
+            and i % args.wandb.log_every_steps == 0
+            and not args.test_run
+        ):
+            if args.model.family == "diffusion_gpt2":
+                 wandb.log(
+                    {
+                        "overall_loss": loss,
+                        "excess_loss": loss / baseline_loss,
+                        "pointwise/loss": dict(
+                            zip(point_wise_tags, point_wise_loss.cpu().numpy())
+                        ),
+                        "n_points": curriculum.n_points,
+                        "n_dims": curriculum.n_dims_truncated,
+                        "masked_ratio": masked_ratio,
+                    },
+                    step=i,
+                )
+            else:
+                wandb.log(
+                    {
+                        "overall_loss": loss,
+                        "excess_loss": loss / baseline_loss,
+                        "pointwise/loss": dict(
+                            zip(point_wise_tags, point_wise_loss.cpu().numpy())
+                        ),
+                        "n_points": curriculum.n_points,
+                        "n_dims": curriculum.n_dims_truncated,
+                    },
+                    step=i,
+                )
 
         curriculum.update()
 
@@ -140,16 +170,29 @@ def main(args):
         curriculum_args.points.start = curriculum_args.points.end
         curriculum_args.dims.start = curriculum_args.dims.end
         args.training.train_steps = 100
+    elif args.wandb.enabled:
+        wandb_kwargs = {
+            "dir": args.out_dir,
+            "project": args.wandb.project,
+            "config": args.to_dict(),
+            "notes": args.wandb.notes,
+            "name": args.wandb.name,
+            "resume": True,
+        }
+        if args.wandb.entity:
+            wandb_kwargs["entity"] = args.wandb.entity
+        try:
+            wandb.init(**wandb_kwargs)
+        except wandb.errors.CommError as exc:
+            msg = (
+                "Failed to initialise Weights & Biases run. "
+                "Please ensure that `wandb.project`/`wandb.entity` are reachable "
+                "and that you are logged in (`wandb login`). "
+                f"Original error: {exc}"
+            )
+            raise RuntimeError(msg) from exc
     else:
-        wandb.init(
-            dir=args.out_dir,
-            project=args.wandb.project,
-            entity=args.wandb.entity,
-            config=args.__dict__,
-            notes=args.wandb.notes,
-            name=args.wandb.name,
-            resume=True,
-        )
+        print("W&B logging disabled; continuing without initialising wandb.")
 
     model = build_model(args.model)
     model.cuda()
@@ -161,10 +204,43 @@ def main(args):
         _ = get_run_metrics(args.out_dir)  # precompute metrics for eval
 
 
+def _parse_overrides(values: Sequence[str]) -> Sequence[str]:
+    overrides = []
+    for value in values:
+        if value.strip():
+            overrides.append(value.strip())
+    return overrides
+
+
+def parse_cli() -> Config:
+    parser = argparse.ArgumentParser(
+        description="Train in-context learning models."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="src/conf/base.yaml",
+        help="Path to the YAML config file.",
+    )
+    parser.add_argument(
+        "-o",
+        "--override",
+        action="append",
+        default=[],
+        help=(
+            "Override configuration values using dot notation, "
+            "e.g. -o training.learning_rate=1e-4"
+        ),
+    )
+    parsed = parser.parse_args()
+    overrides = _parse_overrides(parsed.override)
+    config = load_config(parsed.config, overrides)
+    return config
+
+
 if __name__ == "__main__":
-    parser = QuinineArgumentParser(schema=schema)
-    args = parser.parse_quinfig()
-    assert args.model.family in ["gpt2", "lstm"]
+    args = parse_cli()
+    assert args.model.family in ["gpt2", "lstm", "qwen2.5", "diffusion_gpt2", "diffusion_qwen2"]
     print(f"Running with: {args}")
 
     if not args.test_run:
@@ -177,7 +253,7 @@ if __name__ == "__main__":
             os.makedirs(out_dir)
         args.out_dir = out_dir
 
-        with open(os.path.join(out_dir, "config.yaml"), "w") as yaml_file:
-            yaml.dump(args.__dict__, yaml_file, default_flow_style=False)
+        with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as yaml_file:
+            yaml.dump(args.to_dict(), yaml_file, default_flow_style=False)
 
     main(args)

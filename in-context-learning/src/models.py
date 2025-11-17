@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
-from transformers import GPT2Model, GPT2Config
+import torch.nn.functional as F
+from transformers import GPT2Model, GPT2Config, GPT2LMHeadModel
+from transformers import Qwen2Model, Qwen2Config
 from tqdm import tqdm
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression, Lasso
@@ -19,6 +21,33 @@ def build_model(conf):
             n_embd=conf.n_embd,
             n_layer=conf.n_layer,
             n_head=conf.n_head,
+        )
+    elif conf.family == "qwen2.5":
+        model = Qwen2TransformerModel(
+            n_dims=conf.n_dims,
+            n_positions=conf.n_positions,
+            n_embd=conf.n_embd,
+            n_layer=conf.n_layer,
+            n_head=conf.n_head,
+        )
+    elif conf.family == "diffusion_gpt2":
+        model = DiffusionTransformerModel(
+            n_positions=conf.n_positions,
+            n_embd=conf.n_embd,
+            n_layer=conf.n_layer,
+            n_head=conf.n_head,
+            mask_token_id=getattr(conf, "mask_token_id", 126336),
+            eps=1e-2,
+        )
+    elif conf.family == "diffusion_qwen2":
+        model = Qwen2DiffusionTransformerModel(
+            n_dims=conf.n_dims,
+            n_positions=conf.n_positions,
+            n_embd=conf.n_embd,
+            n_layer=conf.n_layer,
+            n_head=conf.n_head,
+            mask_token_id=getattr(conf, "mask_token_id", 126336),
+            eps=1e-2,
         )
     else:
         raise NotImplementedError
@@ -126,6 +155,411 @@ class TransformerModel(nn.Module):
         prediction = self._read_out(output)
         return prediction[:, ::2, 0][:, inds]  # predict only on xs
 
+class Qwen2TransformerModel(nn.Module):
+    def __init__(self, n_dims, n_positions, n_embd=128, n_layer=12, n_head=4):
+        super(Qwen2TransformerModel, self).__init__()
+        configuration = Qwen2Config(
+            vocab_size=1,  # using embeddings directly, not tokens
+            hidden_size=n_embd,
+            intermediate_size=n_embd * 4,  # Standard ratio for transformers(?)
+            num_hidden_layers=n_layer,
+            num_attention_heads=n_head,
+            num_key_value_heads=n_head,  
+            max_position_embeddings=2 * n_positions,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            use_cache=False,
+        )
+        self.name = f"qwen2.5_embd={n_embd}_layer={n_layer}_head={n_head}"
+
+        self.n_positions = n_positions
+        self.n_dims = n_dims
+        self._read_in = nn.Linear(n_dims, n_embd)
+        self._backbone = Qwen2Model(configuration)
+        self._read_out = nn.Linear(n_embd, 1)
+
+    @staticmethod
+    def _combine(xs_b, ys_b):
+        """Interleaves the x's and the y's into a single sequence."""
+        bsize, points, dim = xs_b.shape
+        ys_b_wide = torch.cat(
+            (
+                ys_b.view(bsize, points, 1),
+                torch.zeros(bsize, points, dim - 1, device=ys_b.device),
+            ),
+            axis=2,
+        )
+        zs = torch.stack((xs_b, ys_b_wide), dim=2)
+        zs = zs.view(bsize, 2 * points, dim)
+        return zs
+
+    def forward(self, xs, ys, inds=None):
+        if inds is None:
+            inds = torch.arange(ys.shape[1])
+        else:
+            inds = torch.tensor(inds)
+            if max(inds) >= ys.shape[1] or min(inds) < 0:
+                raise ValueError("inds contain indices where xs and ys are not defined")
+        zs = self._combine(xs, ys)
+        embeds = self._read_in(zs)
+        output = self._backbone(inputs_embeds=embeds).last_hidden_state
+        prediction = self._read_out(output)
+        return prediction[:, ::2, 0][:, inds]  # predict only on xs
+
+
+class DiffusionTransformerModel(nn.Module):
+    """
+    Diffusion Language Model based on GPT2 for discrete token diffusion.
+    
+    Implements a forward process that masks tokens with probability eps,
+    and trains the model to denoise/predict masked tokens.
+    """
+    
+    def __init__(
+        self,
+        n_positions=1024,
+        n_embd=768,
+        n_layer=12,
+        n_head=12,
+        mask_token_id=126336,
+        eps=1e-3,
+    ):
+        super(DiffusionTransformerModel, self).__init__()
+        self.n_positions = n_positions
+        self.n_dims = 1  # Compatibility with existing code (not used for diffusion)
+        self.mask_token_id = mask_token_id
+        self.eps = eps
+        
+        configuration = GPT2Config(
+            n_positions=2 * n_positions,
+            n_embd=n_embd,
+            n_layer=n_layer,
+            n_head=n_head,
+            resid_pdrop=0.0,
+            embd_pdrop=0.0,
+            attn_pdrop=0.0,
+            use_cache=False,
+        )
+        
+        # Use GPT2Model (not LMHeadModel) since we'll add custom read_in/read_out for continuous values
+        # Note: _read_in needs n_dims but we don't know it at init, so we'll use a placeholder
+        # We'll set it properly in forward based on actual input dims
+        self._read_in = None  # Will be initialized on first forward pass
+        self._backbone = GPT2Model(configuration)
+        self._read_out = nn.Linear(n_embd, 1)  # Output dim is 1 (for y predictions)
+        self.name = f"diffusion_gpt2_embd={n_embd}_layer={n_layer}_head={n_head}"
+    
+    @staticmethod
+    def _combine(xs_b, ys_b):
+        """
+        xs_b: continuous input (b, points, dims)
+        ys_b: continuous input (b, points) -> (b, points, 1) -> (b, points, dims)
+        zs: combined input (b, 2 * points, dims)
+        """
+        bsize, points, dim = xs_b.shape
+        ys_b_wide = torch.cat(
+            (
+                ys_b.view(bsize, points, 1),
+                torch.zeros(bsize, points, dim - 1, device=ys_b.device),
+            ),
+            axis=2,
+        )
+        zs = torch.stack((xs_b, ys_b_wide), dim=2)
+        zs = zs.view(bsize, 2 * points, dim)
+        return zs
+    
+    @staticmethod
+    def forward_process(ys_b, eps=1e-3, mask_token_id=126336, device=None):
+        """
+        ys_b: (b, points)
+        """
+        if device is None:
+            device = ys_b.device
+        b, points= ys_b.shape
+        t = torch.rand(b, device=device) # Sample: t ~ Uniform(0, 1)
+        p_mask = (1 - eps) * t + eps
+        p_mask = p_mask[:, None].repeat(1, points) # Expand to sequence length
+        masked_indices = torch.rand((b, points), device=device) < p_mask
+        noisy_batch = torch.where(masked_indices, mask_token_id, ys_b)
+        return noisy_batch, masked_indices, p_mask
+    
+    def forward(self, xs, ys, inds=None, masked_indices=None):
+        """
+        Forward pass: combine xs and ys, process through backbone, and predict y values.
+        
+        Args:
+            xs: continuous input (b, points, dims)
+            ys: continuous input (b, points) - can be noisy/masked ys
+            inds: Optional indices to return predictions for (default: all y positions)
+            masked_indices: Optional boolean mask (b, points) indicating which y positions are masked.
+                           If provided, creates bidirectional attention mask allowing model to see
+                           all x positions and unmasked y positions.
+        
+        Returns:
+            predictions: (b, points) - predicted y values for all y positions
+        """
+        if inds is None:
+            inds = torch.arange(ys.shape[1])
+        else:
+            inds = torch.tensor(inds)
+            if max(inds) >= ys.shape[1] or min(inds) < 0:
+                raise ValueError("inds contain indices where xs and ys are not defined")
+        
+        zs = self._combine(xs, ys) # (b, 2 * points, dims)
+        if self._read_in is None:
+            dim = zs.shape[2]
+            n_embd = self._backbone.config.n_embd
+            self._read_in = nn.Linear(dim, n_embd).to(zs.device)
+        embeds = self._read_in(zs)  # (b, 2*points, n_embd)
+        
+        # Create bidirectional attention mask for diffusion training
+        attention_mask = None
+        if masked_indices is not None:
+            b, points = masked_indices.shape
+            seq_len = 2 * points
+            n_heads = self._backbone.config.num_attention_heads
+            
+            # Create full bidirectional mask: all positions can see all positions
+            # Shape: (b, n_heads, seq_len, seq_len)
+            # 0.0 = can attend, -inf = cannot attend
+            attention_mask = torch.zeros((b, n_heads, seq_len, seq_len), device=zs.device, dtype=torch.float)
+            
+            for i in range(points):
+                y_idx = 2 * i + 1
+                for batch_idx in range(b):
+                    if masked_indices[batch_idx, i]:
+                        attention_mask[batch_idx, :, :, y_idx] = float('-inf')
+        
+        output = self._backbone(inputs_embeds=embeds, attention_mask=attention_mask).last_hidden_state  # (b, 2*points, n_embd)
+        prediction = self._read_out(output[:, 1::2, :])  # (b, points, 1)
+        return prediction[:, :, 0][:, inds]  # (b, len(inds))
+    
+    def compute_loss(self, xs, ys, eps=None, random_length_prob=0.01):
+        """
+        Compute diffusion loss following the forward process.
+        
+        Process:
+        1. Apply forward_process to ys to get noisy_ys (masked y values)
+        2. Combine xs and noisy_ys to get zs
+        3. Forward pass through model to predict y values
+        4. Compute MSE loss only on masked y positions
+        
+        Args:
+            xs: Continuous input tensor of shape (b, points, dims)
+            ys: Continuous input tensor of shape (b, points) - ground truth y values
+            eps: Masking probability (default: self.eps)
+            random_length_prob: Probability of using random sequence length (default: 0.01)
+        
+        Returns:
+            loss: Scalar loss value (MSE on masked positions)
+            predictions: Model predictions (b, points)
+            masked_indices: Boolean mask of masked positions (b, points)
+        """
+        if eps is None:
+            eps = self.eps
+        
+        b, points, _ = xs.shape
+        
+        # if torch.rand(1).item() < random_length_prob:
+        #     random_length = torch.randint(1, points + 1, (1,)).item()
+        #     xs = xs[:, :random_length, :]
+        #     ys = ys[:, :random_length]
+        #     points = random_length
+        
+        noisy_ys, masked_indices, p_mask = DiffusionTransformerModel.forward_process(
+            ys, eps=eps, mask_token_id=self.mask_token_id, device=ys.device
+        )
+        # Pass masked_indices to forward to enable bidirectional attention
+        predictions = self.forward(xs, noisy_ys, masked_indices=masked_indices)  # (b, points)
+        
+        # Compute loss with proper weighting for diffusion training
+        squared_error = (predictions - ys).square()  # (b, points)
+        
+        if masked_indices.sum() > 0:
+            # Weighted loss: weight by inverse of masking probability (importance sampling)
+            masked_errors = squared_error[masked_indices]  # (num_masked,)
+            weighted_errors = masked_errors / p_mask[masked_indices]  # (num_masked,)
+            # Normalize by total number of positions (not just masked ones)
+            loss = weighted_errors.sum() / (b * points)
+        else:
+            # Fallback: if no positions are masked, compute loss on all positions
+            # This should rarely happen if eps > 0, but provides stability
+            loss = squared_error.mean()
+        
+        return loss, predictions, masked_indices
+
+
+
+class Qwen2DiffusionTransformerModel(nn.Module):
+    """
+    Diffusion Language Model based on Qwen2.5 for discrete token diffusion.
+    
+    Implements a forward process that masks tokens with probability eps,
+    and trains the model to denoise/predict masked tokens.
+    """
+    
+    def __init__(self, n_dims, n_positions, n_embd=128, n_layer=12, n_head=4, mask_token_id=126336, eps=1e-3):
+        super(Qwen2DiffusionTransformerModel, self).__init__()
+        self.n_positions = n_positions
+        self.n_dims = 1  # Compatibility with existing code (not used for diffusion)
+        self.mask_token_id = mask_token_id
+        self.eps = eps
+        
+        configuration = Qwen2Config(
+            vocab_size=1,
+            hidden_size=n_embd,
+            intermediate_size=n_embd * 4,
+            num_hidden_layers=n_layer,
+            num_attention_heads=n_head,
+            num_key_value_heads=n_head,  
+            max_position_embeddings=2 * n_positions,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            use_cache=False,
+        )
+        self._read_in = None
+        self._backbone = Qwen2Model(configuration)
+        self._read_out = nn.Linear(n_embd, 1)
+        self.name = f"qwen2_diffusion_embd={n_embd}_layer={n_layer}_head={n_head}"
+    
+    @staticmethod
+    def _combine(xs_b, ys_b):
+        """
+        xs_b: continuous input (b, points, dims)
+        ys_b: continuous input (b, points) -> (b, points, 1) -> (b, points, dims)
+        zs: combined input (b, 2 * points, dims)
+        """
+        bsize, points, dim = xs_b.shape
+        ys_b_wide = torch.cat(
+            (
+                ys_b.view(bsize, points, 1),
+                torch.zeros(bsize, points, dim - 1, device=ys_b.device),
+            ),
+            axis=2,
+        )
+        zs = torch.stack((xs_b, ys_b_wide), dim=2)
+        zs = zs.view(bsize, 2 * points, dim)
+        return zs
+    
+    @staticmethod
+    def forward_process(ys_b, eps=1e-3, mask_token_id=126336, device=None):
+        """
+        ys_b: (b, points)
+        """
+        if device is None:
+            device = ys_b.device
+        b, points= ys_b.shape
+        t = torch.rand(b, device=device) # Sample: t ~ Uniform(0, 1)
+        p_mask = (1 - eps) * t + eps
+        p_mask = p_mask[:, None].repeat(1, points) # Expand to sequence length
+        masked_indices = torch.rand((b, points), device=device) < p_mask
+        noisy_batch = torch.where(masked_indices, mask_token_id, ys_b)
+        return noisy_batch, masked_indices, p_mask
+    
+    def forward(self, xs, ys, inds=None, masked_indices=None):
+        """
+        Forward pass: combine xs and ys, process through backbone, and predict y values.
+        
+        Args:
+            xs: continuous input (b, points, dims)
+            ys: continuous input (b, points) - can be noisy/masked ys
+            inds: Optional indices to return predictions for (default: all y positions)
+            masked_indices: Optional boolean mask (b, points) indicating which y positions are masked.
+                           If provided, creates bidirectional attention mask allowing model to see
+                           all x positions and unmasked y positions.
+        
+        Returns:
+            predictions: (b, points) - predicted y values for all y positions
+        """
+        if inds is None:
+            inds = torch.arange(ys.shape[1])
+        else:
+            inds = torch.tensor(inds)
+            if max(inds) >= ys.shape[1] or min(inds) < 0:
+                raise ValueError("inds contain indices where xs and ys are not defined")
+        
+        zs = self._combine(xs, ys) # (b, 2 * points, dims)
+        if self._read_in is None:
+            dim = zs.shape[2]
+            n_embd = self._backbone.config.hidden_size
+            self._read_in = nn.Linear(dim, n_embd).to(zs.device)
+        embeds = self._read_in(zs)  # (b, 2*points, n_embd)
+        
+        # Create bidirectional attention mask for diffusion training
+        attention_mask = None
+        if masked_indices is not None:
+            b, points = masked_indices.shape
+            seq_len = 2 * points
+            n_heads = self._backbone.config.num_attention_heads
+            
+            # Create full bidirectional mask: all positions can see all positions
+            # Shape: (b, n_heads, seq_len, seq_len)
+            # 0.0 = can attend, -inf = cannot attend
+            attention_mask = torch.zeros((b, n_heads, seq_len, seq_len), device=zs.device, dtype=torch.float)
+            
+            for i in range(points):
+                y_idx = 2 * i + 1
+                for batch_idx in range(b):
+                    if masked_indices[batch_idx, i]:
+                        attention_mask[batch_idx, :, :, y_idx] = float('-inf')
+        
+        output = self._backbone(inputs_embeds=embeds, attention_mask=attention_mask).last_hidden_state  # (b, 2*points, n_embd)
+        prediction = self._read_out(output[:, 1::2, :])  # (b, points, 1)
+        return prediction[:, :, 0][:, inds]  # (b, len(inds))
+    
+    def compute_loss(self, xs, ys, eps=None, random_length_prob=0.01):
+        """
+        Compute diffusion loss following the forward process.
+        
+        Process:
+        1. Apply forward_process to ys to get noisy_ys (masked y values)
+        2. Combine xs and noisy_ys to get zs
+        3. Forward pass through model to predict y values
+        4. Compute MSE loss only on masked y positions
+        
+        Args:
+            xs: Continuous input tensor of shape (b, points, dims)
+            ys: Continuous input tensor of shape (b, points) - ground truth y values
+            eps: Masking probability (default: self.eps)
+            random_length_prob: Probability of using random sequence length (default: 0.01)
+        
+        Returns:
+            loss: Scalar loss value (MSE on masked positions)
+            predictions: Model predictions (b, points)
+            masked_indices: Boolean mask of masked positions (b, points)
+        """
+        if eps is None:
+            eps = self.eps
+        
+        b, points, _ = xs.shape
+        
+        # if torch.rand(1).item() < random_length_prob:
+        #     random_length = torch.randint(1, points + 1, (1,)).item()
+        #     xs = xs[:, :random_length, :]
+        #     ys = ys[:, :random_length]
+        #     points = random_length
+        
+        noisy_ys, masked_indices, p_mask = Qwen2DiffusionTransformerModel.forward_process(
+            ys, eps=eps, mask_token_id=self.mask_token_id, device=ys.device
+        )
+        # Pass masked_indices to forward to enable bidirectional attention
+        predictions = self.forward(xs, noisy_ys, masked_indices=masked_indices)  # (b, points)
+        
+        # Compute loss with proper weighting for diffusion training
+        squared_error = (predictions - ys).square()  # (b, points)
+        
+        if masked_indices.sum() > 0:
+            # Weighted loss: weight by inverse of masking probability (importance sampling)
+            masked_errors = squared_error[masked_indices]  # (num_masked,)
+            weighted_errors = masked_errors / p_mask[masked_indices]  # (num_masked,)
+            # Normalize by total number of positions (not just masked ones)
+            loss = weighted_errors.sum() / (b * points)
+        else:
+            # Fallback: if no positions are masked, compute loss on all positions
+            # This should rarely happen if eps > 0, but provides stability
+            loss = squared_error.mean()
+        
+        return loss, predictions, masked_indices
 
 class NNModel:
     def __init__(self, n_neighbors, weights="uniform"):

@@ -10,7 +10,6 @@ class DataSampler:
     def sample_xs(self):
         raise NotImplementedError
 
-
 def get_data_sampler(data_name, n_dims, **kwargs):
     names_to_classes = {
         "gaussian": GaussianSampler,
@@ -22,7 +21,6 @@ def get_data_sampler(data_name, n_dims, **kwargs):
         print("Unknown sampler")
         raise NotImplementedError
 
-
 def sample_transformation(eigenvalues, normalize=False):
     n_dims = len(eigenvalues)
     U, _, _ = torch.linalg.svd(torch.randn(n_dims, n_dims))
@@ -31,7 +29,6 @@ def sample_transformation(eigenvalues, normalize=False):
         norm_subspace = torch.sum(eigenvalues**2)
         t *= math.sqrt(n_dims / norm_subspace)
     return t
-
 
 class GaussianSampler(DataSampler):
     def __init__(self, n_dims, bias=None, scale=None):
