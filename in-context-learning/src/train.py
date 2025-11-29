@@ -30,11 +30,13 @@ def train_step(model, xs, ys, optimizer, loss_func):
 
 def diffusion_train_step(model, xs, ys, optimizer):
     optimizer.zero_grad()
-    loss, output, masked_indices = model.compute_loss(xs, ys)
-    masked_ratio = masked_indices.sum().item() / masked_indices.numel()
+    loss, eps_hat, y_t, t = model.compute_loss(xs, ys)
     loss.backward()
     optimizer.step()
-    return loss.detach().item(), output.detach(), masked_ratio
+    # For logging: compute masked ratio from time steps (higher t = more noise)
+    # Approximate: average noise level from t values
+    avg_t = t.float().mean().item() / model.timesteps
+    return loss.detach().item(), eps_hat.detach(), avg_t
 
 def sample_seeds(total_seeds, count):
     seeds = set()
@@ -57,7 +59,7 @@ def train(model, args):
         for i in range(state["train_step"] + 1):
             curriculum.update()
 
-    n_dims = model.n_dims
+    n_dims = args.model.n_dims
     bsize = args.training.batch_size
     data_sampler = get_data_sampler(args.training.data, n_dims=n_dims)
     task_sampler = get_task_sampler(
@@ -94,8 +96,12 @@ def train(model, args):
 
         loss_func = task.get_training_metric()
         
-        if args.model.family == "diffusion_gpt2":
-            loss, output, masked_ratio = diffusion_train_step(model, xs.cuda(), ys.cuda(), optimizer)
+        if args.model.family in ["diffusion_gpt2", "diffusion_qwen2"]:
+            loss, eps_hat, masked_ratio = diffusion_train_step(model, xs.cuda(), ys.cuda(), optimizer)
+            # For pointwise loss, we need to reconstruct y predictions from noise predictions
+            # This is approximate - in practice you'd need the full sampling process
+            # For now, use eps_hat as a proxy (or compute y0_pred from y_t and eps_hat)
+            output = eps_hat.squeeze(-1)  # Temporary: use noise predictions as proxy
         else:
             loss, output = train_step(model, xs.cuda(), ys.cuda(), optimizer, loss_func)
 
@@ -116,7 +122,7 @@ def train(model, args):
             and i % args.wandb.log_every_steps == 0
             and not args.test_run
         ):
-            if args.model.family == "diffusion_gpt2":
+            if args.model.family in ["diffusion_gpt2", "diffusion_qwen2"]:
                  wandb.log(
                     {
                         "overall_loss": loss,

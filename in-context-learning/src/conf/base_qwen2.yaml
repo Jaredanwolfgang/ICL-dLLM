@@ -7,6 +7,7 @@ model:
     n_positions: 256
 
 training:
+    resume_id: "636dc159-e6b4-4e11-bad1-f12092d15e84"
     task: "linear_regression"
     data: gaussian
     task_kwargs: {}
