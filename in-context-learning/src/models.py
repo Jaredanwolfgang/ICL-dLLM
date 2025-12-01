@@ -391,8 +391,8 @@ class DiffusionTransformerModel(nn.Module):
         tok_emb = tok_emb + self.token_type_embed(type_ids)
 
         # 4. Time Embeddings (广播到所有 token)
-        t_emb = self.time_embed(t) # (B, n_embd)
-        tok_emb = tok_emb + t_emb[:, None, :]
+        # t_emb = self.time_embed(t) # (B, n_embd)
+        # tok_emb = tok_emb + t_emb[:, None, :]
 
         # 5. Backbone (GPT2 Causal Attention)
         # 此时的 Causal Mask 允许 y_i 看到 x_i 以及所有之前的 x, y

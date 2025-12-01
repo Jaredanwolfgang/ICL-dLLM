@@ -97,7 +97,10 @@ def train(model, args):
         loss_func = task.get_training_metric()
         
         if args.model.family in ["diffusion_gpt2", "diffusion_qwen2"]:
-            loss, eps_hat, masked_ratio = diffusion_train_step(model, xs.cuda(), ys.cuda(), optimizer)
+            y_mean = ys.mean(dim=1, keepdim=True)
+            y_std = ys.std(dim=1, keepdim=True) + 1e-8
+            ys_norm = (ys - y_mean) / y_std
+            loss, eps_hat, masked_ratio = diffusion_train_step(model, xs.cuda(), ys_norm.cuda(), optimizer)
             # For pointwise loss, we need to reconstruct y predictions from noise predictions
             # This is approximate - in practice you'd need the full sampling process
             # For now, use eps_hat as a proxy (or compute y0_pred from y_t and eps_hat)
