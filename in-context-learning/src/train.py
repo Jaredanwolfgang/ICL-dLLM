@@ -32,7 +32,6 @@ def diffusion_train_step(model, xs, ys, optimizer):
     optimizer.zero_grad()
     loss, eps_pred, y_noisy_full, t = model.compute_loss(xs, ys)
     loss.backward()
-    # 梯度裁剪有助于稳定训练（类似 model_test_large.py）
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     return loss.detach().item(), eps_pred.detach(), y_noisy_full.detach(), t.detach()
@@ -95,7 +94,7 @@ def train(model, args):
 
         loss_func = task.get_training_metric()
         
-        if args.model.family in ["diffusion_gpt2", "diffusion_qwen2"]:
+        if args.model.family in ["diffusion_encoder", "diffusion_decoder"]:
             loss, eps_pred, y_noisy_full, t = diffusion_train_step(model, xs.cuda(), ys.cuda(), optimizer)
             output = eps_pred.squeeze(-1)  # Temporary: use noise predictions as proxy
         else:
@@ -227,7 +226,7 @@ def parse_cli() -> Config:
 
 if __name__ == "__main__":
     args = parse_cli()
-    assert args.model.family in ["gpt2", "lstm", "qwen2.5", "diffusion_gpt2", "diffusion_qwen2"]
+    assert args.model.family in ["gpt2", "lstm", "diffusion_encoder", "diffusion_decoder"]
     print(f"Running with: {args}")
 
     if not args.test_run:

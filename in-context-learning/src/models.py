@@ -23,8 +23,8 @@ def build_model(conf):
             n_layer=conf.n_layer,
             n_head=conf.n_head,
         )
-    elif conf.family == "diffusion_gpt2":
-        model = DiffusionTransformerModel(
+    elif conf.family == "diffusion_encoder":
+        model = DiffusionEncoderModel(
             n_positions=conf.n_positions,
             n_dims=conf.n_dims,
             n_embd=conf.n_embd,
@@ -33,6 +33,14 @@ def build_model(conf):
             timesteps=getattr(conf, "timesteps", 100),
             beta_start=getattr(conf, "beta_start", 1e-4),
             beta_end=getattr(conf, "beta_end", 2e-2),
+        )
+    elif conf.family == "diffusion_decoder":
+        model = DiffusionDecoderModel(
+            n_positions=conf.n_positions,
+            n_dims=conf.n_dims,
+            n_embd=conf.n_embd,
+            n_layer=conf.n_layer,
+            n_head=conf.n_head,
         )
     else:
         raise NotImplementedError
@@ -155,7 +163,7 @@ def extract(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-class DiffusionTransformerModel(nn.Module):
+class DiffusionEncoderModel(nn.Module):
     def __init__(self, n_dims, n_embd=256, n_layer=6, n_head=8, timesteps=100, n_positions=1024, beta_start=1e-4, beta_end=0.02):
         super().__init__()
         self.n_dims = n_dims
@@ -208,6 +216,152 @@ class DiffusionTransformerModel(nn.Module):
         # Backbone
         out = self._backbone(emb)
         # out = self.backbone(inputs_embeds=emb).last_hidden_state
+
+        # Predict Noise
+        return self._read_out(out)
+
+    def q_sample(self, y0, t, noise=None):
+        """
+        标准加噪公式: y_t = sqrt(alpha_bar) * y0 + sqrt(1-alpha_bar) * eps
+        """
+        if noise is None:
+            noise = torch.randn_like(y0)
+            
+        schedule = self._get_schedule(y0.device)
+        
+        sqrt_alphas_cumprod_t = extract(schedule.sqrt_alphas_cumprod, t, y0.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(schedule.sqrt_one_minus_alphas_cumprod, t, y0.shape)
+        
+        y_t = sqrt_alphas_cumprod_t * y0 + sqrt_one_minus_alphas_cumprod_t * noise
+        return y_t, noise
+
+    def compute_loss(self, xs, ys_gt):
+        if ys_gt.dim() == 2:
+            ys_gt = ys_gt.unsqueeze(-1)
+        B, P, _ = ys_gt.shape
+        device = ys_gt.device
+        schedule = self._get_schedule(device)
+
+        t = torch.randint(0, schedule.timesteps, (B,), device=device)
+
+        ks = torch.randint(1, P, (B,), device=device)
+        indices = torch.arange(P, device=device).unsqueeze(0).expand(B, P)
+        mask_target = (indices >= ks.unsqueeze(1)).unsqueeze(-1).float() # (B, P, 1)
+
+        y_noisy_full, noise_true = self.q_sample(ys_gt, t)
+        ys_input = mask_target * y_noisy_full + (1.0 - mask_target) * ys_gt
+
+        eps_pred = self.forward(xs, ys_input, t)
+
+        loss = F.mse_loss(eps_pred, noise_true, reduction='none')
+        loss = (loss * mask_target).sum() / mask_target.sum().clamp(min=1)
+
+        return loss, eps_pred, y_noisy_full, t
+
+    @torch.no_grad()
+    def p_sample(self, xs, y_t, t, t_index):
+        """
+        y_{t-1} = 1/sqrt(alpha) * (y_t - ...) + sigma * z
+        """
+        schedule = self._get_schedule(xs.device)
+        
+        eps_pred = self.forward(xs, y_t, t)  # (B, P, 1)
+        
+        betas_t = extract(schedule.betas, t, y_t.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(schedule.sqrt_one_minus_alphas_cumprod, t, y_t.shape)
+        sqrt_recip_alphas_t = extract(schedule.sqrt_recip_alphas, t, y_t.shape)
+        
+        # mu = (1 / sqrt(alpha_t)) * (y_t - (beta_t / sqrt(1 - alpha_bar_t)) * eps)
+        model_mean = sqrt_recip_alphas_t * (
+            y_t - (betas_t / sqrt_one_minus_alphas_cumprod_t) * eps_pred
+        )
+
+        if t_index > 0:
+            noise = torch.randn_like(y_t)
+            posterior_variance_t = extract(torch.sqrt(schedule.betas), t, y_t.shape)
+            y_prev = model_mean + posterior_variance_t * noise
+        else:
+            y_prev = model_mean
+            
+        return y_prev
+
+    @torch.no_grad()
+    def p_sample_loop(self, xs, ys_demo, n_query):
+        """
+        ICL 推理循环:
+        xs: 全量 x (B, P, D) 包含所有点（demo + query）
+        ys_demo: 已知的 y (Clean) (B, n_demo, 1) 只包含 demo 点
+        n_query: 需要预测的点数
+        """
+        device = xs.device
+        B, P, _ = xs.shape
+        schedule = self._get_schedule(device)
+        n_demo = P - n_query
+        
+        y_query_noisy = torch.randn(B, n_query, 1, device=device)
+        ys_current = torch.cat([ys_demo, y_query_noisy], dim=1) # (B, P, 1)
+        
+        for i in reversed(range(schedule.timesteps)):
+            t = torch.full((B,), i, device=device, dtype=torch.long)
+            y_prev_full = self.p_sample(xs, ys_current, t, i)
+            y_query_updated = y_prev_full[:, n_demo:, :]
+            ys_current = torch.cat([ys_demo, y_query_updated], dim=1)
+        return ys_current
+
+class DiffusionDecoderModel(nn.Module):
+    def __init__(self, n_dims, n_embd=256, n_layer=6, n_head=8, timesteps=100, n_positions=1024, beta_start=1e-4, beta_end=0.02):
+        super().__init__()
+        self.n_dims = n_dims
+        self.n_embd = n_embd
+        self.timesteps = timesteps
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+
+        self._read_in = nn.Linear(n_dims + 1, n_embd)
+        # Time Embedding
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, n_embd),
+            nn.SiLU(),
+            nn.Linear(n_embd, n_embd),
+        )
+        config = GPT2Config(
+            n_positions=2 * n_positions,
+            n_embd=n_embd,
+            n_layer=n_layer,
+            n_head=n_head,
+            resid_pdrop=0.0,
+            embd_pdrop=0.0,
+            attn_pdrop=0.0,
+            use_cache=False,
+        )
+        self._backbone = GPT2Model(config)
+        self._read_out = nn.Linear(n_embd, 1)
+        self.schedule = None
+        self.name = f"diffusion_encoder_embd={n_embd}_layer={n_layer}_head={n_head}_timesteps={timesteps}"
+
+    def _get_schedule(self, device):
+        if self.schedule is None or self.schedule.betas.device != device:
+            self.schedule = DiffusionSchedule(self.timesteps, beta_start=self.beta_start, beta_end=self.beta_end, device=device)
+        return self.schedule
+    
+    def forward(self, xs, ys_current, t):   
+        """
+        xs:         (B, P, Dx) 
+        ys_current: (B, P, 1)
+        t:          (B,)
+        """
+        # Input Projection
+        inp = torch.cat([xs, ys_current], dim=-1) # (B, P, D+1)
+        emb = self._read_in(inp)
+
+        # Time Embedding
+        t_vec = t.float().unsqueeze(-1) / self.timesteps
+        t_emb = self.time_embed(t_vec)            # (B, n_embd)
+        emb = emb + t_emb[:, None, :]
+
+        # Backbone
+        # out = self._backbone(emb)
+        out = self._backbone(inputs_embeds=emb).last_hidden_state
 
         # Predict Noise
         return self._read_out(out)

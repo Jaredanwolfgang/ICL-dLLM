@@ -12,7 +12,7 @@ TASK_LIST = {
     "decision_tree",
 }
 
-MODEL_FAMILIES = {"gpt2", "lstm", "qwen2.5", "diffusion_gpt2", "diffusion_qwen2"}
+MODEL_FAMILIES = {"gpt2", "lstm", "diffusion_encoder", "diffusion_decoder"}
 DATA_SOURCES = {"gaussian"}
 
 
