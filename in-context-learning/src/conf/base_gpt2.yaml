@@ -18,14 +18,14 @@ training:
     curriculum:
         dims:
             end: 20
-            inc: 0
+            inc: 1
             interval: 100
-            start: 20
+            start: 5
         points:
-            end: 20
-            inc: 0
+            end: 41
+            inc: 1
             interval: 100
-            start: 20
+            start: 10
 
 out_dir: "logs/in-context-learning"
 

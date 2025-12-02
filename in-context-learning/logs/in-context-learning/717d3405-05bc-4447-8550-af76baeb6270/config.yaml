@@ -1,0 +1,39 @@
+model:
+  family: diffusion_gpt2
+  n_dims: 20
+  n_embd: 256
+  n_head: 8
+  n_layer: 12
+  n_positions: 101
+out_dir: logs/in-context-learning/717d3405-05bc-4447-8550-af76baeb6270
+test_run: false
+training:
+  batch_size: 64
+  curriculum:
+    dims:
+      end: 20
+      inc: 0
+      interval: 100
+      start: 20
+    points:
+      end: 20
+      inc: 0
+      interval: 100
+      start: 20
+  data: gaussian
+  keep_every_steps: 100000
+  learning_rate: 1.0e-05
+  num_tasks: null
+  num_training_examples: null
+  resume_id: null
+  save_every_steps: 1000
+  task: linear_regression
+  task_kwargs: {}
+  train_steps: 500001
+wandb:
+  enabled: true
+  entity: jaredanjerry-southern-university-of-science-technology
+  log_every_steps: 10
+  name: linear_regression
+  notes: Base configuration
+  project: icl-dllm

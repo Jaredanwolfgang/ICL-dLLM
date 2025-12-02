@@ -78,14 +78,14 @@ class LinearRegression(Task):
         self.scale = scale
 
         if pool_dict is None and seeds is None:
-            self.w_b = torch.randn(self.b_size, self.n_dims, 1)
+            self.w_b = torch.randn(self.b_size, self.n_dims, 1) / math.sqrt(self.n_dims)
         elif seeds is not None:
             self.w_b = torch.zeros(self.b_size, self.n_dims, 1)
             generator = torch.Generator()
             assert len(seeds) == self.b_size
             for i, seed in enumerate(seeds):
                 generator.manual_seed(seed)
-                self.w_b[i] = torch.randn(self.n_dims, 1, generator=generator)
+                self.w_b[i] = torch.randn(self.n_dims, 1, generator=generator) / math.sqrt(self.n_dims)
         else:
             assert "w" in pool_dict
             indices = torch.randperm(len(pool_dict["w"]))[:batch_size]
@@ -98,7 +98,7 @@ class LinearRegression(Task):
 
     @staticmethod
     def generate_pool_dict(n_dims, num_tasks, **kwargs):  # ignore extra args
-        return {"w": torch.randn(num_tasks, n_dims, 1)}
+        return {"w": torch.randn(num_tasks, n_dims, 1) / math.sqrt(n_dims)}
 
     @staticmethod
     def get_metric():

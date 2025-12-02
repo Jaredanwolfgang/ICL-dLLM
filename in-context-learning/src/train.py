@@ -30,13 +30,12 @@ def train_step(model, xs, ys, optimizer, loss_func):
 
 def diffusion_train_step(model, xs, ys, optimizer):
     optimizer.zero_grad()
-    loss, eps_hat, y_t, t = model.compute_loss(xs, ys)
+    loss, eps_pred, y_noisy_full, t = model.compute_loss(xs, ys)
     loss.backward()
+    # 梯度裁剪有助于稳定训练（类似 model_test_large.py）
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    # For logging: compute masked ratio from time steps (higher t = more noise)
-    # Approximate: average noise level from t values
-    avg_t = t.float().mean().item() / model.timesteps
-    return loss.detach().item(), eps_hat.detach(), avg_t
+    return loss.detach().item(), eps_pred.detach(), y_noisy_full.detach(), t.detach()
 
 def sample_seeds(total_seeds, count):
     seeds = set()
@@ -97,14 +96,8 @@ def train(model, args):
         loss_func = task.get_training_metric()
         
         if args.model.family in ["diffusion_gpt2", "diffusion_qwen2"]:
-            y_mean = ys.mean(dim=1, keepdim=True)
-            y_std = ys.std(dim=1, keepdim=True) + 1e-8
-            ys_norm = (ys - y_mean) / y_std
-            loss, eps_hat, masked_ratio = diffusion_train_step(model, xs.cuda(), ys_norm.cuda(), optimizer)
-            # For pointwise loss, we need to reconstruct y predictions from noise predictions
-            # This is approximate - in practice you'd need the full sampling process
-            # For now, use eps_hat as a proxy (or compute y0_pred from y_t and eps_hat)
-            output = eps_hat.squeeze(-1)  # Temporary: use noise predictions as proxy
+            loss, eps_pred, y_noisy_full, t = diffusion_train_step(model, xs.cuda(), ys.cuda(), optimizer)
+            output = eps_pred.squeeze(-1)  # Temporary: use noise predictions as proxy
         else:
             loss, output = train_step(model, xs.cuda(), ys.cuda(), optimizer, loss_func)
 
@@ -125,33 +118,18 @@ def train(model, args):
             and i % args.wandb.log_every_steps == 0
             and not args.test_run
         ):
-            if args.model.family in ["diffusion_gpt2", "diffusion_qwen2"]:
-                 wandb.log(
-                    {
-                        "overall_loss": loss,
-                        "excess_loss": loss / baseline_loss,
-                        "pointwise/loss": dict(
-                            zip(point_wise_tags, point_wise_loss.cpu().numpy())
-                        ),
-                        "n_points": curriculum.n_points,
-                        "n_dims": curriculum.n_dims_truncated,
-                        "masked_ratio": masked_ratio,
-                    },
-                    step=i,
-                )
-            else:
-                wandb.log(
-                    {
-                        "overall_loss": loss,
-                        "excess_loss": loss / baseline_loss,
-                        "pointwise/loss": dict(
-                            zip(point_wise_tags, point_wise_loss.cpu().numpy())
-                        ),
-                        "n_points": curriculum.n_points,
-                        "n_dims": curriculum.n_dims_truncated,
-                    },
-                    step=i,
-                )
+            wandb.log(
+                {
+                    "overall_loss": loss,
+                    "excess_loss": loss / baseline_loss,
+                    "pointwise/loss": dict(
+                        zip(point_wise_tags, point_wise_loss.cpu().numpy())
+                    ),
+                    "n_points": curriculum.n_points,
+                    "n_dims": curriculum.n_dims_truncated,
+                },
+                step=i,
+            )
 
         curriculum.update()
 
