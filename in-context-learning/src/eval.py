@@ -36,9 +36,17 @@ def get_model_from_run(run_path, step=-1, only_conf=False):
 
 
 # Functions for evaluation
-
-
-def eval_batch(model, task_sampler, xs, xs_p=None):
+def eval_batch(model, task_sampler, xs, xs_p=None, eval_timesteps=None):
+    """
+    Evaluate a batch of examples.
+    
+    Args:
+        model: The model to evaluate
+        task_sampler: Task sampler
+        xs: Input features (B, P, D)
+        xs_p: Progressive input features (optional)
+        eval_timesteps: Number of timesteps for diffusion sampling (None = use full timesteps, smaller = faster)
+    """
     task = task_sampler()
     
     # Check if model is a diffusion model
@@ -49,57 +57,50 @@ def eval_batch(model, task_sampler, xs, xs_p=None):
     else:
         device = "cpu"
     
-    # Move model to device if it's a diffusion model
+    model = model.to(device)
     if is_diffusion_model:
-        model = model.to(device)
+        if eval_timesteps is None:
+            eval_timesteps = 200
 
     if xs_p is None:
         ys = task.evaluate(xs)
-        
         if is_diffusion_model:
-            # For diffusion models, use p_sample_loop
-            # Prepare data: xs should contain all points, ys should be (B, P, 1)
             xs_device = xs.to(device)
             if ys.dim() == 2:
                 ys_device = ys.unsqueeze(-1).to(device)  # (B, P) -> (B, P, 1)
             else:
                 ys_device = ys.to(device)
-            
             B, n_points, _ = xs_device.shape
-            metrics = torch.zeros(B, n_points)
             
+            metrics = {
+                "mean": [],
+                "std": [],
+                "bootstrap_low": [],
+                "bootstrap_high": []
+            }
+            metric_func = task.get_metric()
             with torch.no_grad():
-                # For each point i, use points 0..i-1 as demo and predict point i
-                # This matches the standard evaluation protocol
-                for i in range(n_points):
-                    if i == 0:
-                        # First point: no demo points available, use baseline
-                        metrics[:, 0] = model.n_dims if hasattr(model, 'n_dims') else 1.0
-                    else:
-                        # Use first i points as demo, predict point i (n_query=1)
-                        n_demo = i
-                        n_query = 1
-                        ys_demo = ys_device[:, :n_demo, :]  # (B, n_demo, 1)
-                        
-                        # p_sample_loop needs xs with all points (demo + query)
-                        # For point i, we only need xs up to point i
-                        xs_subset = xs_device[:, :i+1, :]  # (B, i+1, D)
-                        
-                        # Predict point i
-                        ys_pred_full = model.p_sample_loop(xs_subset, ys_demo, n_query)
-                        
-                        # Extract prediction for point i (last point in the output)
-                        pred_point = ys_pred_full[:, -1:, :]  # (B, 1, 1)
-                        truth_point = ys_device[:, i:i+1, :]  # (B, 1, 1)
-                        
-                        # Compute metric for this point
-                        point_metrics = task.get_metric()(pred_point.cpu(), truth_point.cpu())
-                        if point_metrics.dim() == 2:
-                            metrics[:, i] = point_metrics[:, 0]
-                        elif point_metrics.dim() == 1:
-                            metrics[:, i] = point_metrics
-                        else:
-                            metrics[:, i] = point_metrics.squeeze()
+                for i in range(n_points): # i represents the number of demo points
+                    n_demo = i
+                    n_query = n_points - n_demo
+                    ys_demo = ys_device[:, :n_demo, :]  # (B, n_demo, 1)
+                    # Use faster sampling with fewer timesteps
+                    ys_pred_full = model.p_sample_loop(xs_device, ys_demo, n_query, eval_timesteps=eval_timesteps)
+                    pred_query = ys_pred_full[:, -n_query:, :]  # (B, n_query, 1)
+                    truth_query = ys_device[:, -n_query:, :]  # (B, n_query, 1)
+                    point_metrics = metric_func(pred_query.squeeze(-1).cpu(), truth_query.squeeze(-1).cpu()).reshape(-1) # (B * n_query)
+                    bootstrap_trials = 1000
+                    idx = torch.randint(0, len(point_metrics), (bootstrap_trials, len(point_metrics)))
+                    bootstrap_samples = point_metrics[idx].mean(dim=1)  # mean loss each bootstrap
+                    sorted_bs = torch.sort(bootstrap_samples)[0]
+                    low = sorted_bs[int(0.05 * bootstrap_trials)].item()
+                    high = sorted_bs[int(0.95 * bootstrap_trials)].item()
+                    mean = bootstrap_samples.mean().item()
+                    std = bootstrap_samples.std().item()
+                    metrics["mean"].append(mean)
+                    metrics["std"].append(std)
+                    metrics["bootstrap_low"].append(low)
+                    metrics["bootstrap_high"].append(high)
         else:
             # For standard models, use the regular forward pass
             pred = model(xs.to(device), ys.to(device)).detach()
@@ -107,52 +108,53 @@ def eval_batch(model, task_sampler, xs, xs_p=None):
     else:
         # Progressive evaluation: predict each point given previous points
         b_size, n_points, _ = xs.shape
-        metrics = torch.zeros(b_size, n_points)
-        
         if is_diffusion_model:
             # For diffusion models with xs_p, we need to handle progressive prediction
+            metrics = {
+                "mean": [],
+                "std": [],
+                "bootstrap_low": [],
+                "bootstrap_high": []
+            }
+            metric_func = task.get_metric()
             for i in range(n_points):
                 xs_comb = torch.cat((xs[:, :i, :], xs_p[:, i:, :]), dim=1)
                 ys = task.evaluate(xs_comb)
-                
                 xs_comb_device = xs_comb.to(device)
                 if ys.dim() == 2:
                     ys_device = ys.unsqueeze(-1).to(device)
                 else:
                     ys_device = ys.to(device)
                 
-                # For point i, we use points 0..i-1 as demo and predict point i
-                if i == 0:
-                    # First point: no demo points available
-                    metrics[:, 0] = model.n_dims if hasattr(model, 'n_dims') else 1.0
-                else:
-                    n_demo = i
-                    n_query = 1
-                    ys_demo = ys_device[:, :n_demo, :]  # (B, n_demo, 1)
-                    
-                    # For point i, we need xs up to point i
-                    xs_subset = xs_comb_device[:, :i+1, :]  # (B, i+1, D)
-                    
-                    with torch.no_grad():
-                        ys_pred_full = model.p_sample_loop(xs_subset, ys_demo, n_query)
-                        pred_point = ys_pred_full[:, -1:, :]  # (B, 1, 1)
-                        truth_point = ys_device[:, i:i+1, :]  # (B, 1, 1)
-                        point_metrics = task.get_metric()(pred_point.cpu(), truth_point.cpu())
-                        if point_metrics.dim() == 2:
-                            metrics[:, i] = point_metrics[:, 0]
-                        elif point_metrics.dim() == 1:
-                            metrics[:, i] = point_metrics
-                        else:
-                            metrics[:, i] = point_metrics.squeeze()
+                n_demo = i
+                n_query = n_points - n_demo
+                ys_demo = ys_device[:, :n_demo, :]  # (B, n_demo, 1)
+                with torch.no_grad():
+                    # Use faster sampling with fewer timesteps
+                    ys_pred_full = model.p_sample_loop(xs_comb_device, ys_demo, n_query, eval_timesteps=eval_timesteps)
+                    pred_query = ys_pred_full[:, -n_query:, :]  # (B, n_query, 1)
+                    truth_query = ys_device[:, -n_query:, :]  # (B, n_query, 1)
+                    point_metrics = metric_func(pred_query.squeeze(-1).cpu(), truth_query.squeeze(-1).cpu()).reshape(-1) # (B * n_query)
+                    bootstrap_trials = 1000
+                    idx = torch.randint(0, len(point_metrics), (bootstrap_trials, len(point_metrics)))
+                    bootstrap_samples = point_metrics[idx].mean(dim=1)  # mean loss each bootstrap
+                    sorted_bs = torch.sort(bootstrap_samples)[0]
+                    low = sorted_bs[int(0.05 * bootstrap_trials)].item()
+                    high = sorted_bs[int(0.95 * bootstrap_trials)].item()
+                    mean = bootstrap_samples.mean().item()
+                    std = bootstrap_samples.std().item()
+                    metrics["mean"].append(mean)
+                    metrics["std"].append(std)
+                    metrics["bootstrap_low"].append(low)
+                    metrics["bootstrap_high"].append(high)
         else:
             # Standard models with progressive evaluation
+            metrics = torch.zeros(b_size, n_points)
             for i in range(n_points):
                 xs_comb = torch.cat((xs[:, :i, :], xs_p[:, i:, :]), dim=1)
                 ys = task.evaluate(xs_comb)
-
-                pred = model(xs_comb.to(device), ys.to(device), inds=[i]).detach()
-                metrics[:, i] = task.get_metric()(pred.cpu(), ys)[:, i]
-
+                pred = model(xs_comb.to(device), ys.to(device), inds=[i]).detach() # (B, n_points)
+                metrics[:, i] = task.get_metric()(pred.cpu(), ys)[:, i] # (B, 1)
     return metrics
 
 
@@ -238,9 +240,17 @@ def aggregate_metrics(metrics, bootstrap_trials=1000):
     bootstrap_means = metrics[bootstrap_indices].mean(dim=1).sort(dim=0)[0]
     results["bootstrap_low"] = bootstrap_means[int(0.05 * bootstrap_trials), :]
     results["bootstrap_high"] = bootstrap_means[int(0.95 * bootstrap_trials), :]
-
     return {k: v.tolist() for k, v in results.items()}
 
+def aggregate_metrics_diffusion(metrics):
+    # metrics is a list of list of dicts with {mean, std, bootstrap_low, bootstrap_high}
+    # we want to aggregate the metrics for each point
+    results = {}
+    results["mean"] = torch.tensor([m["mean"] for m in metrics]).mean(dim=0) # (eval/batch, n_points) -> (n_points)
+    results["std"] = torch.tensor([m["std"] for m in metrics]).mean(dim=0) # (eval/batch, n_points) -> (n_points)
+    results["bootstrap_low"] = torch.tensor([m["bootstrap_low"] for m in metrics]).mean(dim=0) # (eval/batch, n_points) -> (n_points)
+    results["bootstrap_high"] = torch.tensor([m["bootstrap_high"] for m in metrics]).mean(dim=0) # (eval/batch, n_points) -> (n_points)
+    return {k: v.tolist() for k, v in results.items()}
 
 def eval_model(
     model,
@@ -253,6 +263,7 @@ def eval_model(
     batch_size=64,
     data_sampler_kwargs={},
     task_sampler_kwargs={},
+    eval_timesteps=None,
 ):
     """
     Evaluate a model on a task with a variety of strategies.
@@ -272,15 +283,20 @@ def eval_model(
     all_metrics = []
 
     generating_func = globals()[f"gen_{prompting_strategy}"]
+    
+    is_diffusion_model = model.name.startswith("diffusion_")
+    
     for i in range(num_eval_examples // batch_size):
         xs, xs_p = generating_func(data_sampler, n_points, batch_size)
-
-        metrics = eval_batch(model, task_sampler, xs, xs_p)
+        metrics = eval_batch(model, task_sampler, xs, xs_p, eval_timesteps=eval_timesteps)
         all_metrics.append(metrics)
 
-    metrics = torch.cat(all_metrics, dim=0)
+    if is_diffusion_model:
+        metrics = aggregate_metrics_diffusion(all_metrics)
+    else:
+        metrics = aggregate_metrics(torch.cat(all_metrics, dim=0))
 
-    return aggregate_metrics(metrics)
+    return metrics
 
 
 def build_evals(conf):

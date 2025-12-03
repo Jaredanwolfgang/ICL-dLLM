@@ -289,22 +289,36 @@ class DiffusionEncoderModel(nn.Module):
         return y_prev
 
     @torch.no_grad()
-    def p_sample_loop(self, xs, ys_demo, n_query):
+    def p_sample_loop(self, xs, ys_demo, n_query, eval_timesteps=None):
         """
         ICL 推理循环:
         xs: 全量 x (B, P, D) 包含所有点（demo + query）
         ys_demo: 已知的 y (Clean) (B, n_demo, 1) 只包含 demo 点
         n_query: 需要预测的点数
+        eval_timesteps: 评估时使用的采样步数（None = 使用训练时的 timesteps，用于加速评估）
         """
         device = xs.device
         B, P, _ = xs.shape
         schedule = self._get_schedule(device)
         n_demo = P - n_query
         
+        # Use fewer timesteps for faster evaluation
+        if eval_timesteps is None:
+            timesteps_to_use = schedule.timesteps
+            step_size = 1
+        else:
+            timesteps_to_use = min(eval_timesteps, schedule.timesteps)
+            step_size = schedule.timesteps // timesteps_to_use
+        
         y_query_noisy = torch.randn(B, n_query, 1, device=device)
         ys_current = torch.cat([ys_demo, y_query_noisy], dim=1) # (B, P, 1)
         
-        for i in reversed(range(schedule.timesteps)):
+        # Use stride sampling for faster evaluation
+        timestep_list = list(reversed(range(0, schedule.timesteps, step_size)))
+        if timestep_list[-1] != 0:
+            timestep_list.append(0)
+        
+        for i in timestep_list:
             t = torch.full((B,), i, device=device, dtype=torch.long)
             y_prev_full = self.p_sample(xs, ys_current, t, i)
             y_query_updated = y_prev_full[:, n_demo:, :]
@@ -435,22 +449,36 @@ class DiffusionDecoderModel(nn.Module):
         return y_prev
 
     @torch.no_grad()
-    def p_sample_loop(self, xs, ys_demo, n_query):
+    def p_sample_loop(self, xs, ys_demo, n_query, eval_timesteps=None):
         """
         ICL 推理循环:
         xs: 全量 x (B, P, D) 包含所有点（demo + query）
         ys_demo: 已知的 y (Clean) (B, n_demo, 1) 只包含 demo 点
         n_query: 需要预测的点数
+        eval_timesteps: 评估时使用的采样步数（None = 使用训练时的 timesteps，用于加速评估）
         """
         device = xs.device
         B, P, _ = xs.shape
         schedule = self._get_schedule(device)
         n_demo = P - n_query
         
+        # Use fewer timesteps for faster evaluation
+        if eval_timesteps is None:
+            timesteps_to_use = schedule.timesteps
+            step_size = 1
+        else:
+            timesteps_to_use = min(eval_timesteps, schedule.timesteps)
+            step_size = schedule.timesteps // timesteps_to_use
+        
         y_query_noisy = torch.randn(B, n_query, 1, device=device)
         ys_current = torch.cat([ys_demo, y_query_noisy], dim=1) # (B, P, 1)
         
-        for i in reversed(range(schedule.timesteps)):
+        # Use stride sampling for faster evaluation
+        timestep_list = list(reversed(range(0, schedule.timesteps, step_size)))
+        if timestep_list[-1] != 0:
+            timestep_list.append(0)
+        
+        for i in timestep_list:
             t = torch.full((B,), i, device=device, dtype=torch.long)
             y_prev_full = self.p_sample(xs, ys_current, t, i)
             y_query_updated = y_prev_full[:, n_demo:, :]
