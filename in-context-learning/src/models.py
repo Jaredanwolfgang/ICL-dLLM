@@ -41,6 +41,9 @@ def build_model(conf):
             n_embd=conf.n_embd,
             n_layer=conf.n_layer,
             n_head=conf.n_head,
+            timesteps=getattr(conf, "timesteps", 100),
+            beta_start=getattr(conf, "beta_start", 1e-4),
+            beta_end=getattr(conf, "beta_end", 2e-2),
         )
     else:
         raise NotImplementedError
@@ -337,7 +340,7 @@ class DiffusionDecoderModel(nn.Module):
         self._backbone = GPT2Model(config)
         self._read_out = nn.Linear(n_embd, 1)
         self.schedule = None
-        self.name = f"diffusion_encoder_embd={n_embd}_layer={n_layer}_head={n_head}_timesteps={timesteps}"
+        self.name = f"diffusion_decoder_embd={n_embd}_layer={n_layer}_head={n_head}_timesteps={timesteps}"
 
     def _get_schedule(self, device):
         if self.schedule is None or self.schedule.betas.device != device:
