@@ -56,10 +56,10 @@ The evaluation notebooks in `src/plot/` contain code to:
 
 ## Collaborators
 
-[Moxin Tang](moxintang@berkeley.edu) Student ID: 3041997936
-[Ruizhe Song](rzsong@berkeley.edu) Student ID: 3042013171
-[Weiyi Zhang](zhangwy0430@berkeley.edu) Student ID: 3042031814
-[Yicheng Xiao](jaredanjerry@berkeley.edu) Student ID: 3042011144
+- [Moxin Tang](moxintang@berkeley.edu) Student ID: 3041997936
+- [Ruizhe Song](rzsong@berkeley.edu) Student ID: 3042013171
+- [Weiyi Zhang](zhangwy0430@berkeley.edu) Student ID: 3042031814
+- [Yicheng Xiao](https://jaredanwolfgang.github.io/about/) Student ID: 3042011144
 
 ## Acknowledgments
 
