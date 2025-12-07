@@ -75,7 +75,7 @@ def eval_batch(model, task_sampler, xs, xs_p=None, eval_timesteps=None):
             metrics = torch.zeros(b_size, n_points)
             metric_func = task.get_metric()
             with torch.no_grad():
-                for i in range(n_points): # i represents the point index to evaluate on
+                for i in tqdm(range(n_points), desc="Evaluating points"): # i represents the point index to evaluate on
                     n_demo = i
                     n_query = 1  # Evaluate on single point i
                     # Take first i x, y pairs as demo, evaluate on point i
@@ -85,7 +85,7 @@ def eval_batch(model, task_sampler, xs, xs_p=None, eval_timesteps=None):
                     
                     ys_demo = ys_device[:, :n_demo, :]  # (b_size, n_demo, 1)
                     # Use faster sampling with fewer timesteps
-                    ys_pred_full = model.p_sample_loop(xs_combined, ys_demo, n_query, eval_timesteps=eval_timesteps)
+                    ys_pred_full = model.p_sample_loop(xs_combined, ys_demo, n_query, eval_timesteps=1)
                     pred_query = ys_pred_full[:, -n_query:, :]  # (b_size, 1, 1)
                     truth_query = ys_device[:, i:i+1, :]  # (b_size, 1, 1)
                     point_metrics = metric_func(pred_query.squeeze(-1).cpu(), truth_query.squeeze(-1).cpu()).reshape(-1) # (b_size,)
@@ -300,41 +300,41 @@ def build_evals(conf):
             evaluation_kwargs[name].update(kwargs)
         return evaluation_kwargs
 
-    # for strategy in [
-    #     "random_quadrants",
-    #     "orthogonal_train_test",
-    #     "overlapping_train_test",
-    # ]:
-    #     evaluation_kwargs[strategy] = {"prompting_strategy": strategy}
+    for strategy in [
+        "random_quadrants",
+        "orthogonal_train_test",
+        "overlapping_train_test",
+    ]:
+        evaluation_kwargs[strategy] = {"prompting_strategy": strategy}
 
-    # for method in ["half_subspace", "skewed"]:
-    #     if "subspace" in method:
-    #         eigenvals = torch.zeros(n_dims)
-    #         eigenvals[: n_dims // 2] = 1
-    #     else:
-    #         eigenvals = 1 / (torch.arange(n_dims) + 1)
+    for method in ["half_subspace", "skewed"]:
+        if "subspace" in method:
+            eigenvals = torch.zeros(n_dims)
+            eigenvals[: n_dims // 2] = 1
+        else:
+            eigenvals = 1 / (torch.arange(n_dims) + 1)
 
-    #     scale = sample_transformation(eigenvals, normalize=True)
-    #     evaluation_kwargs[f"{method}"] = {
-    #         "data_sampler_kwargs": {"scale": scale},
-    #     }
+        scale = sample_transformation(eigenvals, normalize=True)
+        evaluation_kwargs[f"{method}"] = {
+            "data_sampler_kwargs": {"scale": scale},
+        }
 
-    # for dim in ["x", "y"]:
-    #     for scale in [0.333, 0.5, 2, 3]:
-    #         if dim == "x":
-    #             eigenvals = scale * torch.ones(n_dims)
-    #             t = sample_transformation(eigenvals)
-    #             scaling_args = {"data_sampler_kwargs": {"scale": t}}
-    #         else:
-    #             eigenvals = scale * torch.ones(n_dims)
-    #             scaling_args = {"task_sampler_kwargs": {"scale": scale}}
+    for dim in ["x", "y"]:
+        for scale in [0.333, 0.5, 2, 3]:
+            if dim == "x":
+                eigenvals = scale * torch.ones(n_dims)
+                t = sample_transformation(eigenvals)
+                scaling_args = {"data_sampler_kwargs": {"scale": t}}
+            else:
+                eigenvals = scale * torch.ones(n_dims)
+                scaling_args = {"task_sampler_kwargs": {"scale": scale}}
 
-    #         evaluation_kwargs[f"scale-{dim}={scale}"] = scaling_args
+            evaluation_kwargs[f"scale-{dim}={scale}"] = scaling_args
 
-    # evaluation_kwargs[f"noisyLR"] = {
-    #     "task_sampler_kwargs": {"renormalize_ys": True, "noise_std": 1},
-    #     "task_name": "noisy_linear_regression",
-    # }
+    evaluation_kwargs[f"noisyLR"] = {
+        "task_sampler_kwargs": {"renormalize_ys": True, "noise_std": 1},
+        "task_name": "noisy_linear_regression",
+    }
 
     for name, kwargs in evaluation_kwargs.items():
         # allow kwargs to override base_kwargs values

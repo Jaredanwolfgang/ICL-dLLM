@@ -10,9 +10,9 @@ from eval import (
 # ========================================
 # UPDATE THIS WITH YOUR RUN ID!
 # ========================================
-run_id = "diffusion_encoder_wotim"  # Replace with your run_id from training
+run_id = "7133f891-9051-47e7-9373-801b594c02a3"  # Replace with your run_id from training
 # ========================================
 
-run_path = os.path.join("/workspace/in-context-learning/logs/in-context-learning/", run_id)
+run_path = os.path.join("/workspace/in-context-learning/models/models/relu2nn_encoder/", run_id)
 
 _ = get_run_metrics(run_path, skip_baselines=True)
