@@ -1,0 +1,38 @@
+model:
+    family: diffusion_encoder
+    n_embd: 256
+    n_layer: 12
+    n_head: 8
+    n_dims: 20
+    n_positions: 101
+
+training:
+    task: "decision_tree"
+    data: gaussian
+    batch_size: 64
+    learning_rate: 1e-5
+    save_every_steps: 1000
+    keep_every_steps: 100000
+    train_steps: 500001
+    task_kwargs: {"depth": 4}
+    curriculum:
+        dims:
+            end: 20
+            inc: 1
+            interval: 100
+            start: 5
+        points:
+            start: 26
+            end: 101
+            inc: 5
+            interval: 2000
+
+out_dir: "../models/decision_tree_encoder"
+
+wandb:
+    enabled: true
+    project: icl-dllm
+    entity: jaredanjerry-southern-university-of-science-technology
+    notes: "Training"
+    name: "decision_tree_encoder"
+    log_every_steps: 10

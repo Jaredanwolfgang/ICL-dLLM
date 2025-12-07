@@ -54,10 +54,10 @@ def eval_batch(model, task_sampler, xs, xs_p=None, eval_timesteps=None):
     
     if torch.cuda.is_available() and (model.name.split("_")[0] in ["gpt2", "lstm"] or is_diffusion_model):
         device = "cuda"
+        model = model.to(device)
     else:
         device = "cpu"
     
-    model = model.to(device)
     if is_diffusion_model:
         if eval_timesteps is None:
             eval_timesteps = 200
@@ -70,55 +70,42 @@ def eval_batch(model, task_sampler, xs, xs_p=None, eval_timesteps=None):
                 ys_device = ys.unsqueeze(-1).to(device)  # (B, P) -> (B, P, 1)
             else:
                 ys_device = ys.to(device)
-            B, n_points, _ = xs_device.shape
+            b_size, n_points, _ = xs_device.shape   # (b_size, n_points, n_dims)
             
-            metrics = {
-                "mean": [],
-                "std": [],
-                "bootstrap_low": [],
-                "bootstrap_high": []
-            }
+            metrics = torch.zeros(b_size, n_points)
             metric_func = task.get_metric()
             with torch.no_grad():
-                for i in range(n_points): # i represents the number of demo points
+                for i in range(n_points): # i represents the point index to evaluate on
                     n_demo = i
-                    n_query = n_points - n_demo
-                    ys_demo = ys_device[:, :n_demo, :]  # (B, n_demo, 1)
+                    n_query = 1  # Evaluate on single point i
+                    # Take first i x, y pairs as demo, evaluate on point i
+                    xs_demo = xs_device[:, :n_demo, :]  # (b_size, n_demo, n_dims)
+                    xs_query = xs_device[:, i:i+1, :]  # (b_size, 1, n_dims)
+                    xs_combined = torch.cat([xs_demo, xs_query], dim=1)  # (b_size, n_demo+1, n_dims)
+                    
+                    ys_demo = ys_device[:, :n_demo, :]  # (b_size, n_demo, 1)
                     # Use faster sampling with fewer timesteps
-                    ys_pred_full = model.p_sample_loop(xs_device, ys_demo, n_query, eval_timesteps=eval_timesteps)
-                    pred_query = ys_pred_full[:, -n_query:, :]  # (B, n_query, 1)
-                    truth_query = ys_device[:, -n_query:, :]  # (B, n_query, 1)
-                    point_metrics = metric_func(pred_query.squeeze(-1).cpu(), truth_query.squeeze(-1).cpu()).reshape(-1) # (B * n_query)
-                    bootstrap_trials = 1000
-                    idx = torch.randint(0, len(point_metrics), (bootstrap_trials, len(point_metrics)))
-                    bootstrap_samples = point_metrics[idx].mean(dim=1)  # mean loss each bootstrap
-                    sorted_bs = torch.sort(bootstrap_samples)[0]
-                    low = sorted_bs[int(0.05 * bootstrap_trials)].item()
-                    high = sorted_bs[int(0.95 * bootstrap_trials)].item()
-                    mean = bootstrap_samples.mean().item()
-                    std = bootstrap_samples.std().item()
-                    metrics["mean"].append(mean)
-                    metrics["std"].append(std)
-                    metrics["bootstrap_low"].append(low)
-                    metrics["bootstrap_high"].append(high)
+                    ys_pred_full = model.p_sample_loop(xs_combined, ys_demo, n_query, eval_timesteps=eval_timesteps)
+                    pred_query = ys_pred_full[:, -n_query:, :]  # (b_size, 1, 1)
+                    truth_query = ys_device[:, i:i+1, :]  # (b_size, 1, 1)
+                    point_metrics = metric_func(pred_query.squeeze(-1).cpu(), truth_query.squeeze(-1).cpu()).reshape(-1) # (b_size,)
+                    metrics[:, i] = point_metrics
         else:
             # For standard models, use the regular forward pass
-            pred = model(xs.to(device), ys.to(device)).detach()
+            pred = model(xs.to(device), ys.to(device)).detach() # (b_size, n_points)
             metrics = task.get_metric()(pred.cpu(), ys)
     else:
         # Progressive evaluation: predict each point given previous points
-        b_size, n_points, _ = xs.shape
+        b_size, n_points, _ = xs.shape   # (b_size, n_points, n_dims)
         if is_diffusion_model:
             # For diffusion models with xs_p, we need to handle progressive prediction
-            metrics = {
-                "mean": [],
-                "std": [],
-                "bootstrap_low": [],
-                "bootstrap_high": []
-            }
+            metrics = torch.zeros(b_size, n_points)   # (b_size, n_points)
             metric_func = task.get_metric()
             for i in range(n_points):
-                xs_comb = torch.cat((xs[:, :i, :], xs_p[:, i:, :]), dim=1)
+                # Take first i x pairs as demo, point i from xs_p as query
+                xs_demo = xs[:, :i, :]  # (b_size, i, n_dims)
+                xs_query = xs_p[:, i:i+1, :]  # (b_size, 1, n_dims)
+                xs_comb = torch.cat((xs_demo, xs_query), dim=1)  # (b_size, i+1, n_dims)
                 ys = task.evaluate(xs_comb)
                 xs_comb_device = xs_comb.to(device)
                 if ys.dim() == 2:
@@ -127,26 +114,15 @@ def eval_batch(model, task_sampler, xs, xs_p=None, eval_timesteps=None):
                     ys_device = ys.to(device)
                 
                 n_demo = i
-                n_query = n_points - n_demo
-                ys_demo = ys_device[:, :n_demo, :]  # (B, n_demo, 1)
+                n_query = 1  # Evaluate on single point i
+                ys_demo = ys_device[:, :n_demo, :]  # (b_size, n_demo, 1)
                 with torch.no_grad():
                     # Use faster sampling with fewer timesteps
                     ys_pred_full = model.p_sample_loop(xs_comb_device, ys_demo, n_query, eval_timesteps=eval_timesteps)
-                    pred_query = ys_pred_full[:, -n_query:, :]  # (B, n_query, 1)
-                    truth_query = ys_device[:, -n_query:, :]  # (B, n_query, 1)
-                    point_metrics = metric_func(pred_query.squeeze(-1).cpu(), truth_query.squeeze(-1).cpu()).reshape(-1) # (B * n_query)
-                    bootstrap_trials = 1000
-                    idx = torch.randint(0, len(point_metrics), (bootstrap_trials, len(point_metrics)))
-                    bootstrap_samples = point_metrics[idx].mean(dim=1)  # mean loss each bootstrap
-                    sorted_bs = torch.sort(bootstrap_samples)[0]
-                    low = sorted_bs[int(0.05 * bootstrap_trials)].item()
-                    high = sorted_bs[int(0.95 * bootstrap_trials)].item()
-                    mean = bootstrap_samples.mean().item()
-                    std = bootstrap_samples.std().item()
-                    metrics["mean"].append(mean)
-                    metrics["std"].append(std)
-                    metrics["bootstrap_low"].append(low)
-                    metrics["bootstrap_high"].append(high)
+                    pred_query = ys_pred_full[:, -n_query:, :]  # (b_size, 1, 1)
+                    truth_query = ys_device[:, i:i+1, :]  # (b_size, 1, 1)
+                    point_metrics = metric_func(pred_query.squeeze(-1).cpu(), truth_query.squeeze(-1).cpu()).reshape(-1) # (B,)
+                    metrics[:, i] = point_metrics
         else:
             # Standard models with progressive evaluation
             metrics = torch.zeros(b_size, n_points)
@@ -156,10 +132,6 @@ def eval_batch(model, task_sampler, xs, xs_p=None, eval_timesteps=None):
                 pred = model(xs_comb.to(device), ys.to(device), inds=[i]).detach() # (B, n_points)
                 metrics[:, i] = task.get_metric()(pred.cpu(), ys)[:, i] # (B, 1)
     return metrics
-
-
-# Functions for generating different kinds of train/test data
-
 
 def gen_standard(data_sampler, n_points, b_size):
     xs = data_sampler.sample_xs(n_points, b_size)
@@ -240,6 +212,7 @@ def aggregate_metrics(metrics, bootstrap_trials=1000):
     bootstrap_means = metrics[bootstrap_indices].mean(dim=1).sort(dim=0)[0]
     results["bootstrap_low"] = bootstrap_means[int(0.05 * bootstrap_trials), :]
     results["bootstrap_high"] = bootstrap_means[int(0.95 * bootstrap_trials), :]
+    print(results)
     return {k: v.tolist() for k, v in results.items()}
 
 def aggregate_metrics_diffusion(metrics):
@@ -259,7 +232,7 @@ def eval_model(
     n_dims,
     n_points,
     prompting_strategy,
-    num_eval_examples=1280,
+    num_eval_examples=640,
     batch_size=64,
     data_sampler_kwargs={},
     task_sampler_kwargs={},
@@ -291,11 +264,10 @@ def eval_model(
         metrics = eval_batch(model, task_sampler, xs, xs_p, eval_timesteps=eval_timesteps)
         all_metrics.append(metrics)
 
-    if is_diffusion_model:
-        metrics = aggregate_metrics_diffusion(all_metrics)
-    else:
-        metrics = aggregate_metrics(torch.cat(all_metrics, dim=0))
-
+    # if is_diffusion_model:
+    #     metrics = aggregate_metrics_diffusion(all_metrics)
+    # else:
+    metrics = aggregate_metrics(torch.cat(all_metrics, dim=0))
     return metrics
 
 
@@ -328,41 +300,41 @@ def build_evals(conf):
             evaluation_kwargs[name].update(kwargs)
         return evaluation_kwargs
 
-    for strategy in [
-        "random_quadrants",
-        "orthogonal_train_test",
-        "overlapping_train_test",
-    ]:
-        evaluation_kwargs[strategy] = {"prompting_strategy": strategy}
+    # for strategy in [
+    #     "random_quadrants",
+    #     "orthogonal_train_test",
+    #     "overlapping_train_test",
+    # ]:
+    #     evaluation_kwargs[strategy] = {"prompting_strategy": strategy}
 
-    for method in ["half_subspace", "skewed"]:
-        if "subspace" in method:
-            eigenvals = torch.zeros(n_dims)
-            eigenvals[: n_dims // 2] = 1
-        else:
-            eigenvals = 1 / (torch.arange(n_dims) + 1)
+    # for method in ["half_subspace", "skewed"]:
+    #     if "subspace" in method:
+    #         eigenvals = torch.zeros(n_dims)
+    #         eigenvals[: n_dims // 2] = 1
+    #     else:
+    #         eigenvals = 1 / (torch.arange(n_dims) + 1)
 
-        scale = sample_transformation(eigenvals, normalize=True)
-        evaluation_kwargs[f"{method}"] = {
-            "data_sampler_kwargs": {"scale": scale},
-        }
+    #     scale = sample_transformation(eigenvals, normalize=True)
+    #     evaluation_kwargs[f"{method}"] = {
+    #         "data_sampler_kwargs": {"scale": scale},
+    #     }
 
-    for dim in ["x", "y"]:
-        for scale in [0.333, 0.5, 2, 3]:
-            if dim == "x":
-                eigenvals = scale * torch.ones(n_dims)
-                t = sample_transformation(eigenvals)
-                scaling_args = {"data_sampler_kwargs": {"scale": t}}
-            else:
-                eigenvals = scale * torch.ones(n_dims)
-                scaling_args = {"task_sampler_kwargs": {"scale": scale}}
+    # for dim in ["x", "y"]:
+    #     for scale in [0.333, 0.5, 2, 3]:
+    #         if dim == "x":
+    #             eigenvals = scale * torch.ones(n_dims)
+    #             t = sample_transformation(eigenvals)
+    #             scaling_args = {"data_sampler_kwargs": {"scale": t}}
+    #         else:
+    #             eigenvals = scale * torch.ones(n_dims)
+    #             scaling_args = {"task_sampler_kwargs": {"scale": scale}}
 
-            evaluation_kwargs[f"scale-{dim}={scale}"] = scaling_args
+    #         evaluation_kwargs[f"scale-{dim}={scale}"] = scaling_args
 
-    evaluation_kwargs[f"noisyLR"] = {
-        "task_sampler_kwargs": {"renormalize_ys": True, "noise_std": 1},
-        "task_name": "noisy_linear_regression",
-    }
+    # evaluation_kwargs[f"noisyLR"] = {
+    #     "task_sampler_kwargs": {"renormalize_ys": True, "noise_std": 1},
+    #     "task_name": "noisy_linear_regression",
+    # }
 
     for name, kwargs in evaluation_kwargs.items():
         # allow kwargs to override base_kwargs values

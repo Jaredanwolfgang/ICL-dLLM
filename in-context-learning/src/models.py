@@ -89,11 +89,11 @@ def get_relevant_baselines(task_name):
             ),
         ],
         "decision_tree": [
+            (XGBoostModel, {}),
             (LeastSquaresModel, {}),
             (NNModel, {"n_neighbors": 3}),
             (DecisionTreeModel, {"max_depth": 4}),
             (DecisionTreeModel, {"max_depth": None}),
-            (XGBoostModel, {}),
             (AveragingModel, {}),
         ],
     }
@@ -212,9 +212,9 @@ class DiffusionEncoderModel(nn.Module):
         emb = self._read_in(inp)
 
         # Time Embedding
-        t_vec = t.float().unsqueeze(-1) / self.timesteps
-        t_emb = self.time_embed(t_vec)            # (B, n_embd)
-        emb = emb + t_emb[:, None, :]
+        # t_vec = t.float().unsqueeze(-1) / self.timesteps
+        # t_emb = self.time_embed(t_vec)            # (B, n_embd)
+        # emb = emb + t_emb[:, None, :]
 
         # Backbone
         out = self._backbone(emb)
@@ -372,9 +372,9 @@ class DiffusionDecoderModel(nn.Module):
         emb = self._read_in(inp)
 
         # Time Embedding
-        t_vec = t.float().unsqueeze(-1) / self.timesteps
-        t_emb = self.time_embed(t_vec)            # (B, n_embd)
-        emb = emb + t_emb[:, None, :]
+        # t_vec = t.float().unsqueeze(-1) / self.timesteps
+        # t_emb = self.time_embed(t_vec)            # (B, n_embd)
+        # emb = emb + t_emb[:, None, :]
 
         # Backbone
         # out = self._backbone(emb)
@@ -796,7 +796,6 @@ class DecisionTreeModel:
 
         return torch.stack(preds, dim=1)
 
-
 class XGBoostModel:
     def __init__(self):
         self.name = "xgboost"
@@ -823,7 +822,10 @@ class XGBoostModel:
                 for j in range(ys.shape[0]):
                     train_xs, train_ys = xs[j, :i], ys[j, :i]
 
-                    clf = xgb.XGBRegressor()
+                    clf = xgb.XGBRegressor(
+                        tree_method="hist",
+                        device="cuda",
+                    )
 
                     clf = clf.fit(train_xs, train_ys)
                     test_x = xs[j, i : i + 1]

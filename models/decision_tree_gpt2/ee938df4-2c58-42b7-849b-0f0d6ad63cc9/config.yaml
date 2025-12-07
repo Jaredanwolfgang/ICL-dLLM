@@ -1,0 +1,40 @@
+model:
+  family: gpt2
+  n_dims: 20
+  n_embd: 256
+  n_head: 8
+  n_layer: 12
+  n_positions: 256
+out_dir: ../models/decision_tree_gpt2/ee938df4-2c58-42b7-849b-0f0d6ad63cc9
+test_run: false
+training:
+  batch_size: 64
+  curriculum:
+    dims:
+      end: 20
+      inc: 1
+      interval: 100
+      start: 5
+    points:
+      end: 41
+      inc: 1
+      interval: 100
+      start: 10
+  data: gaussian
+  keep_every_steps: -1
+  learning_rate: 0.0003
+  num_tasks: null
+  num_training_examples: null
+  resume_id: null
+  save_every_steps: 100000
+  task: decision_tree
+  task_kwargs:
+    depth: 4
+  train_steps: 500001
+wandb:
+  enabled: true
+  entity: jaredanjerry-southern-university-of-science-technology
+  log_every_steps: 10
+  name: decision_tree_gpt2
+  notes: Training
+  project: icl-dllm

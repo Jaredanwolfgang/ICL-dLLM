@@ -2,3 +2,6 @@
 __pycache__
 models.zip
 models
+output*
+logs
+metrics*
